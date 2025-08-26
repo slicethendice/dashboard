@@ -1,0 +1,241 @@
+// config/profiles.js
+module.exports = {
+  baseline: {
+    MIN_PROFIT_SOL: 0.00002,
+    MAX_LOSS_SOL: 0.00002,
+    FORCE_EXIT_MS: 180000,
+
+    REENTRY_COOLDOWN_MS: 30000,
+    REENTRY_PULLBACK_PCT: 0.08,
+    REENTRY_CONTINUE_PCT: 0.12,
+    REENTRY_RECOVERY_PCT: 0.15,
+    REENTRY_BAND_PCT: 0.06,
+    REENTRY_MAX_WAIT_MS: 240000,
+
+    FEE_BUFFER_SOL: 0.00001,
+    TP_BUFFER_BPS: 6,
+    MAX_PRICE_IMPACT_BPS: 40,
+
+    RATE_LIMIT_RPM: 48,
+    QUOTE_JITTER_MS: 150,
+    QUOTE_CACHE_MS: 1000,
+    BACKOFF_BASE_MS: 800,
+    BACKOFF_MAX_MS: 6000,
+    HOLD_IDLE_BPS: 4,
+    HOLD_IDLE_BOOST_MS: 1200,
+
+    // ENTRY_SIGNAL: {
+    //   MAX_WAIT_MS: 180000, // give up after 3m if no entry
+    //   SAMPLE_MS: 1000, // probe every 1s
+    //   WINDOW_SAMPLES: 10, // keep last 10 samples (~10s)
+    //   MIN_UP_SLOPE_BPS_SEC: 3, // require positive momentum (bps/sec)
+    //   MIN_ABOVE_SMA_BPS: 5, // current price must be > SMA by 5 bps
+    //   MIN_BREAKOUT_PCT: 0.3, // OR breakout ≥0.30% over window max
+    //   MAX_DROP_PCT_WINDOW: 1.5, // reject if sliding >1.5% from local max
+    //   MAX_SPREAD_BPS: 60, // approximate roundtrip spread ceiling
+    //   MAX_IMPACT_BPS: 40, // from your sell guard threshold idea
+    //   OK_ROUTE_STREAK: 2, // need N consecutive successful probes
+    //   PROBE_SOL: 0.002, // tiny SOL probe size
+    // },
+
+    ENTRY_SIGNAL: {
+      MAX_WAIT_MS: 180000, // max wait
+      SAMPLE_MS: 300, // probe every 0.3s
+      WINDOW_SAMPLES: 5, // ~1.2–1.5s window
+      MIN_UP_SLOPE_BPS_SEC: -8, // allows downsloping momentum
+      MIN_ABOVE_SMA_BPS: 0, // ignore SMA requirement
+      MIN_BREAKOUT_PCT: 0.0, // no breakout needed
+      MAX_DROP_PCT_WINDOW: 5.0, // big slide tolerated
+      MAX_SPREAD_BPS: 180, // very wide spread allowed
+      MAX_IMPACT_BPS: 120, // very loose impact gate
+      OK_ROUTE_STREAK: 1, // 1 consecutive route is enough
+      PROBE_SOL: 0.001, // tiny probe
+    },
+  },
+
+  wide_tp: {
+    MIN_PROFIT_SOL: 0.00005,
+    MAX_LOSS_SOL: 0.00005,
+    FORCE_EXIT_MS: 420000,
+
+    REENTRY_COOLDOWN_MS: 45000,
+    REENTRY_PULLBACK_PCT: 0.12,
+    REENTRY_CONTINUE_PCT: 0.2,
+    REENTRY_RECOVERY_PCT: 0.25,
+    REENTRY_BAND_PCT: 0.1,
+    REENTRY_MAX_WAIT_MS: 360000,
+
+    FEE_BUFFER_SOL: 0.000012,
+    TP_BUFFER_BPS: 6,
+    MAX_PRICE_IMPACT_BPS: 40,
+
+    RATE_LIMIT_RPM: 48,
+    QUOTE_JITTER_MS: 150,
+    QUOTE_CACHE_MS: 1200,
+    BACKOFF_BASE_MS: 1000,
+    BACKOFF_MAX_MS: 8000,
+    HOLD_IDLE_BPS: 2,
+    HOLD_IDLE_BOOST_MS: 1500,
+  },
+
+  scalp_fast: {
+    MIN_PROFIT_SOL: 0.00001,
+    MAX_LOSS_SOL: 0.00003,
+    FORCE_EXIT_MS: 120000,
+
+    REENTRY_COOLDOWN_MS: 20000,
+    REENTRY_PULLBACK_PCT: 0.06,
+    REENTRY_CONTINUE_PCT: 0.1,
+    REENTRY_RECOVERY_PCT: 0.12,
+    REENTRY_BAND_PCT: 0.05,
+    REENTRY_MAX_WAIT_MS: 180000,
+
+    FEE_BUFFER_SOL: 0.000012,
+    TP_BUFFER_BPS: 4,
+    MAX_PRICE_IMPACT_BPS: 30,
+
+    RATE_LIMIT_RPM: 50,
+    QUOTE_JITTER_MS: 120,
+    QUOTE_CACHE_MS: 800,
+    BACKOFF_BASE_MS: 800,
+    BACKOFF_MAX_MS: 6000,
+    HOLD_IDLE_BPS: 5,
+    HOLD_IDLE_BOOST_MS: 800,
+  },
+
+  momentum_breakout: {
+    MIN_PROFIT_SOL: 0.00003,
+    MAX_LOSS_SOL: 0.00006,
+    FORCE_EXIT_MS: 360000,
+
+    REENTRY_COOLDOWN_MS: 30000,
+    REENTRY_PULLBACK_PCT: 0.08,
+    REENTRY_CONTINUE_PCT: 0.25,
+    REENTRY_RECOVERY_PCT: 0.22,
+    REENTRY_BAND_PCT: 0.1,
+    REENTRY_MAX_WAIT_MS: 360000,
+
+    FEE_BUFFER_SOL: 0.000012,
+    TP_BUFFER_BPS: 6,
+    MAX_PRICE_IMPACT_BPS: 60,
+
+    RATE_LIMIT_RPM: 48,
+    QUOTE_JITTER_MS: 150,
+    QUOTE_CACHE_MS: 1200,
+    BACKOFF_BASE_MS: 1000,
+    BACKOFF_MAX_MS: 8000,
+    HOLD_IDLE_BPS: 2,
+    HOLD_IDLE_BOOST_MS: 1500,
+  },
+
+  range_meanrev: {
+    MIN_PROFIT_SOL: 0.00002,
+    MAX_LOSS_SOL: 0.00004,
+    FORCE_EXIT_MS: 240000,
+
+    REENTRY_COOLDOWN_MS: 20000,
+    REENTRY_PULLBACK_PCT: 0.14,
+    REENTRY_CONTINUE_PCT: 0.18,
+    REENTRY_RECOVERY_PCT: 0.18,
+    REENTRY_BAND_PCT: 0.07,
+    REENTRY_MAX_WAIT_MS: 240000,
+
+    FEE_BUFFER_SOL: 0.00001,
+    TP_BUFFER_BPS: 5,
+    MAX_PRICE_IMPACT_BPS: 45,
+
+    RATE_LIMIT_RPM: 46,
+    QUOTE_JITTER_MS: 150,
+    QUOTE_CACHE_MS: 1100,
+    BACKOFF_BASE_MS: 900,
+    BACKOFF_MAX_MS: 7000,
+    HOLD_IDLE_BPS: 4,
+    HOLD_IDLE_BOOST_MS: 1200,
+  },
+
+  low_liq_safe: {
+    MIN_PROFIT_SOL: 0.00004,
+    MAX_LOSS_SOL: 0.00004,
+    FORCE_EXIT_MS: 240000,
+
+    REENTRY_COOLDOWN_MS: 45000,
+    REENTRY_PULLBACK_PCT: 0.12,
+    REENTRY_CONTINUE_PCT: 0.18,
+    REENTRY_RECOVERY_PCT: 0.22,
+    REENTRY_BAND_PCT: 0.1,
+    REENTRY_MAX_WAIT_MS: 300000,
+
+    FEE_BUFFER_SOL: 0.000015,
+    TP_BUFFER_BPS: 8,
+    MAX_PRICE_IMPACT_BPS: 25,
+
+    RATE_LIMIT_RPM: 40,
+    QUOTE_JITTER_MS: 200,
+    QUOTE_CACHE_MS: 1500,
+    BACKOFF_BASE_MS: 1200,
+    BACKOFF_MAX_MS: 10000,
+    HOLD_IDLE_BPS: 5,
+    HOLD_IDLE_BOOST_MS: 1500,
+  },
+
+  high_fee_chain: {
+    MIN_PROFIT_SOL: 0.00006,
+    MAX_LOSS_SOL: 0.00005,
+    FORCE_EXIT_MS: 300000,
+
+    REENTRY_COOLDOWN_MS: 40000,
+    REENTRY_PULLBACK_PCT: 0.1,
+    REENTRY_CONTINUE_PCT: 0.16,
+    REENTRY_RECOVERY_PCT: 0.22,
+    REENTRY_BAND_PCT: 0.08,
+    REENTRY_MAX_WAIT_MS: 300000,
+
+    FEE_BUFFER_SOL: 0.00002,
+    TP_BUFFER_BPS: 8,
+    MAX_PRICE_IMPACT_BPS: 40,
+
+    RATE_LIMIT_RPM: 45,
+    QUOTE_JITTER_MS: 150,
+    QUOTE_CACHE_MS: 1200,
+    BACKOFF_BASE_MS: 1000,
+    BACKOFF_MAX_MS: 9000,
+    HOLD_IDLE_BPS: 3,
+    HOLD_IDLE_BOOST_MS: 1200,
+  },
+
+  overnight_slow: {
+    MIN_PROFIT_SOL: 0.00003,
+    MAX_LOSS_SOL: 0.00005,
+    FORCE_EXIT_MS: 600000,
+
+    REENTRY_COOLDOWN_MS: 60000,
+    REENTRY_PULLBACK_PCT: 0.12,
+    REENTRY_CONTINUE_PCT: 0.18,
+    REENTRY_RECOVERY_PCT: 0.24,
+    REENTRY_BAND_PCT: 0.1,
+    REENTRY_MAX_WAIT_MS: 600000,
+
+    FEE_BUFFER_SOL: 0.000012,
+    TP_BUFFER_BPS: 5,
+    MAX_PRICE_IMPACT_BPS: 50,
+
+    RATE_LIMIT_RPM: 35,
+    QUOTE_JITTER_MS: 250,
+    QUOTE_CACHE_MS: 1500,
+    BACKOFF_BASE_MS: 1200,
+    BACKOFF_MAX_MS: 10000,
+    HOLD_IDLE_BPS: 2,
+    HOLD_IDLE_BOOST_MS: 2000,
+  },
+  paper_sim: {
+    MIN_PROFIT_SOL: -1, // allow any profit
+    MAX_LOSS_SOL: 1, // allow any loss
+    FORCE_EXIT_MS: 120000, // 2 min max hold
+    TP_BUFFER_BPS: 0, // don’t block on edge
+    MAX_PRICE_IMPACT_BPS: 9999, // allow any slippage
+    RATE_LIMIT_RPM: 40, // Stay comfortably under 60
+    QUOTE_CACHE_MS: 300,
+    HOLD_IDLE_BPS: 0,
+    HOLD_IDLE_BOOST_MS: 0,
+  },
+};
