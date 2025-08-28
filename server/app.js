@@ -1,114 +1,162 @@
-// app.js
+// app.js — Express API server with Helius stream integration
+
 require("dotenv").config();
 const express = require("express");
-const mongoose = require("mongoose");
-const path = require("path");
+const cors = require("cors");
+const fetch = require("node-fetch");
+const crypto = require("crypto");
 
-const { PORT = 5000, MONGO_URI } = process.env;
+const { createWalletMintStream } = require("./heliusStream");
+
 const app = express();
-app.use(express.json());
-app.use("/", express.static(path.join(__dirname))); // serve index.html + index.js
+const PORT = Number(process.env.PORT || 1234);
 
-// --- Mongoose (inline model, read-only) ---
-const { Schema, model } = require("mongoose");
-const Trade = model(
-  "Trade",
-  new Schema(
-    {
-      ts: Date,
-      mint: String,
-      side: String,
-      qty: String,
-      price: Number,
-    },
-    { collection: "trades", strict: false }
-  )
-);
-
-// --- summarize helper (entries/exits + KPIs) ---
-function summarize(rows) {
-  const sells = rows
-    .filter((r) => r.side === "SELL")
-    .map((r, i) => ({
-      cycle: i + 1,
-      reason: "sell",
-      buySOL: NaN,
-      sellSOL: r.price * Number(r.qty || 1),
-      netProfit: Number.isFinite(r.pnl) ? r.pnl : 0,
-      priceChangePct: NaN,
-      timeHeldSec: NaN,
-      entrySlope: NaN,
-      entrySpread: NaN,
-      bankroll: NaN,
-    }));
-  const trades = sells.length,
-    total = sells.reduce((a, b) => a + (b.netProfit || 0), 0);
-  const wins = sells.filter((s) => (s.netProfit || 0) > 0).length;
-  return {
-    sells,
-    pollsByCycle: [],
-    kpis: {
-      trades,
-      winPct: trades ? (wins / trades) * 100 : 0,
-      total,
-      avg: trades ? total / trades : 0,
-      p50HoldSec: NaN,
-      p90HoldSec: NaN,
-    },
-  };
+// Structured logger
+function jlog(level, msg, ctx = {}) {
+  const line = { level, msg, ts: new Date().toISOString(), ...ctx };
+  console.log(JSON.stringify(line));
 }
 
-// --- routes ---
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
-
-app.get("/api/trades", async (req, res) => {
-  try {
-    const q = {};
-    if (req.query.mint) q.mint = req.query.mint;
-    const limit = Math.min(Number(req.query.limit || 500), 5000);
-    const rows = await Trade.find(q).sort({ ts: -1 }).limit(limit).lean();
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-app.get("/api/trades/summary", async (req, res) => {
-  try {
-    const q = {};
-    if (req.query.mint) q.mint = req.query.mint;
-    const limit = Math.min(Number(req.query.limit || 500), 5000);
-    const rows = await Trade.find(q).sort({ ts: -1 }).limit(limit).lean();
-    res.json(summarize(rows));
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-// live price (reuse your getQuote.js)
-const { getQuote } = require("./getQuote.js"); // keep your file
-app.get("/api/price", async (req, res) => {
-  try {
-    const {
-      mint,
-      vs = "So11111111111111111111111111111111111111112",
-      amount = "1000000",
-    } = req.query; // default 1e6 base units
-    if (!mint) return res.status(400).json({ error: "mint required" });
-    const quote = await getQuote({ inMint: mint, outMint: vs, amount });
-    res.json(quote);
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-// --- boot ---
-mongoose
-  .connect(MONGO_URI)
-  .then(() => {
-    app.listen(PORT, () => console.log(`[api] http://localhost:${PORT}`));
-  })
-  .catch((err) => {
-    console.error("[db] error:", err.message);
-    process.exit(1);
+// req-id
+app.use((req, _res, next) => {
+  req.id = crypto.randomBytes(4).toString("hex");
+  jlog("info", "request", {
+    reqId: req.id,
+    method: req.method,
+    url: req.originalUrl,
+    ip: req.ip,
+    ua: req.headers["user-agent"],
   });
+  next();
+});
+
+app.use(cors());
+app.use(express.json({ limit: "512kb" }));
+
+// Health
+app.get("/api/health", (_req, res) => {
+  jlog("info", "[health] hit /api/health");
+  res.status(200).json({ ok: true, ts: Date.now() });
+});
+
+// --- Stream wiring ---
+async function saveEventToDB(_event) {
+  // plug in your DB if desired
+}
+
+const stream = createWalletMintStream({
+  heliusApiKey: process.env.HELIUS_API_KEY,
+  onEvent: (e) =>
+    saveEventToDB(e).catch((err) =>
+      jlog("error", "[stream] saveEventToDB failed", {
+        err: err.message || String(err),
+      })
+    ),
+  onLog: ({ level, msg, context }) =>
+    jlog(`stream:${level}`, msg, context || {}),
+});
+
+let connectedFlag = false;
+let currentPair = { wallet: null, mint: null };
+
+async function startStreamImpl(args) {
+  if (typeof stream.connect === "function") return stream.connect(args);
+  if (typeof stream.start === "function") return stream.start(args);
+  throw new Error("No start/connect method on stream");
+}
+async function stopStreamImpl() {
+  if (typeof stream.disconnect === "function") return stream.disconnect();
+  if (typeof stream.stop === "function") return stream.stop();
+  throw new Error("No stop/disconnect method on stream");
+}
+function isStreamConnected() {
+  if (typeof stream.isConnected === "function") return !!stream.isConnected();
+  if ("connected" in stream) return !!stream.connected;
+  return connectedFlag;
+}
+
+function isBase58(s) {
+  return typeof s === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s);
+}
+
+const startStream = async (req, res) => {
+  const payload =
+    (req.body && Object.keys(req.body).length ? req.body : req.query) || {};
+  const wallet = payload.wallet || null;
+  const mint = payload.mint || null;
+  const reqId = req.id;
+
+  // REQUIRE BOTH for your use case
+  if (!wallet || !mint) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Provide BOTH wallet and mint" });
+  }
+  if (!isBase58(wallet)) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Invalid wallet (base58 expected)" });
+  }
+  if (!isBase58(mint)) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Invalid mint (base58 expected)" });
+  }
+
+  try {
+    await startStreamImpl({ wallet, mint });
+    currentPair = { wallet, mint };
+    connectedFlag = true;
+    jlog("info", "/api/stream/start connected", { reqId, wallet, mint });
+    res.json({ ok: true, status: "connected", wallet, mint });
+  } catch (e) {
+    jlog("error", "/api/stream/start failed", {
+      reqId,
+      err: e.message || String(e),
+    });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+};
+
+const stopStream = async (req, res) => {
+  const reqId = req.id;
+  try {
+    await stopStreamImpl();
+    const prev = currentPair;
+    currentPair = { wallet: null, mint: null };
+    connectedFlag = false;
+    jlog("info", "/api/stream/stop ok", { reqId, prev });
+    res.json({ ok: true, status: "stopped", prev });
+  } catch (e) {
+    jlog("error", "/api/stream/stop failed", {
+      reqId,
+      err: e.message || String(e),
+    });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+};
+
+app.post("/api/stream/start", startStream);
+app.get("/api/stream/start", startStream);
+
+app.post("/api/stream/stop", stopStream);
+app.get("/api/stream/stop", stopStream);
+
+app.get("/api/stream/status", (_req, res) => {
+  res.json({ ok: true, connected: isStreamConnected(), pair: currentPair });
+});
+
+// --- 404 ---
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Not Found",
+    method: req.method,
+    path: req.originalUrl,
+  });
+});
+
+// --- Start server ---
+app.listen(PORT, () => {
+  jlog("info", `API server listening on http://localhost:${PORT}`);
+});
