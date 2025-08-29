@@ -1,51 +1,322 @@
-// app.js — Express API server with Helius stream integration
+// app.js — Express API server with Helius stream integration (ALL endpoints under /api)
+// - Uses your existing ./heliusStream.js (no hardcoded wallet/mint)
+// - Control routes:  POST /api/stream/start, POST /api/stream/stop, GET /api/stream/status
+// - Analytics:       GET  /api/review, GET /api/ohlc
+// - Utilities:       GET  /api/wallet/summary, GET /api/health, GET /api/_routes
+// - Production touches: JSON logging, strict CORS via ORIGIN env, graceful shutdown,
+//                       retrying Helius RPC, signature-time fallback, ATA resolution cache.
 
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
+const http = require("http");
 
-const { createWalletMintStream } = require("./heliusStream");
-
+// ===== ENV & App bootstrap =====
 const app = express();
 const PORT = Number(process.env.PORT || 1234);
+const ORIGIN = process.env.ORIGIN || ""; // e.g. https://dashboard.yourdomain.com
+const NODE_ENV = process.env.NODE_ENV || "development";
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 
-// Structured logger
-function jlog(level, msg, ctx = {}) {
-  const line = { level, msg, ts: new Date().toISOString(), ...ctx };
-  console.log(JSON.stringify(line));
+// Warn if key missing (health still works; data endpoints will fail)
+if (!HELIUS_API_KEY) {
+  console.warn(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "warn",
+      msg: "HELIUS_API_KEY not set — data endpoints will be empty/fail",
+    })
+  );
 }
 
-// req-id
-app.use((req, _res, next) => {
-  req.id = crypto.randomBytes(4).toString("hex");
-  jlog("info", "request", {
-    reqId: req.id,
-    method: req.method,
-    url: req.originalUrl,
-    ip: req.ip,
-    ua: req.headers["user-agent"],
+// ===== Logging (JSON) =====
+const DEBUG_API = process.env.DEBUG_API === "1"; // per-request logs
+const DEBUG_HELIUS = process.env.DEBUG_HELIUS === "1"; // Helius RPC timings
+
+function jlog(level, msg, ctx = {}) {
+  try {
+    const line = { ts: new Date().toISOString(), level, msg, ...ctx };
+    console.log(JSON.stringify(line));
+  } catch {
+    console.log(`[${level}] ${msg}`);
+  }
+}
+
+// Per-request logger and X-Request-Id header
+app.use((req, res, next) => {
+  const id =
+    (crypto.randomUUID && crypto.randomUUID()) ||
+    Math.random().toString(36).slice(2);
+  req.id = id;
+  res.setHeader("X-Request-Id", id);
+
+  const started = process.hrtime.bigint();
+  if (DEBUG_API) {
+    jlog("info", "request", {
+      reqId: id,
+      method: req.method,
+      url: req.originalUrl,
+      ip: req.ip,
+      ua: req.headers["user-agent"],
+    });
+  }
+  res.on("finish", () => {
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    jlog("info", "response", {
+      reqId: id,
+      method: req.method,
+      url: req.originalUrl,
+      status: res.statusCode,
+      ms: Number(ms.toFixed(1)),
+    });
   });
   next();
 });
 
-app.use(cors());
+// Strict CORS if ORIGIN provided, else permissive (dev)
+app.use(
+  cors(
+    ORIGIN
+      ? {
+          origin: ORIGIN.split(",").map((s) => s.trim()),
+          credentials: false,
+          methods: ["GET", "POST", "OPTIONS"],
+          allowedHeaders: ["Content-Type", "X-Request-Id"],
+          maxAge: 86400,
+        }
+      : {}
+  )
+);
+
+app.disable("x-powered-by");
 app.use(express.json({ limit: "512kb" }));
 
-// Health
-app.get("/api/health", (_req, res) => {
-  jlog("info", "[health] hit /api/health");
-  res.status(200).json({ ok: true, ts: Date.now() });
-});
+// ===== Helius helpers =====
+const HELIUS_REST_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-// --- Stream wiring ---
-async function saveEventToDB(_event) {
-  // plug in your DB if desired
+async function heliusRPC(
+  method,
+  params,
+  { timeoutMs = 8000, retries = 2, reqId = "-" } = {}
+) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const started = process.hrtime.bigint();
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(HELIUS_REST_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: controller.signal,
+      });
+      clearTimeout(t);
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      if (!res.ok) throw new Error(`Helius HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.error)
+        throw new Error(`Helius RPC error: ${JSON.stringify(json.error)}`);
+      if (DEBUG_HELIUS)
+        jlog("debug", "helius ok", {
+          reqId,
+          method,
+          ms: Number(ms.toFixed(1)),
+          size: json?.result?.length,
+        });
+      return json.result;
+    } catch (e) {
+      clearTimeout(t);
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      lastErr = e;
+      jlog("warn", "helius failed", {
+        reqId,
+        method,
+        attempt: `${attempt + 1}/${retries + 1}`,
+        ms: Number(ms.toFixed(1)),
+        err: e.message || String(e),
+      });
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+    }
+  }
+  throw lastErr || new Error("Helius RPC failed");
+}
+
+function rangeStartTs(range = "all") {
+  const now = Date.now();
+  const D = 24 * 60 * 60 * 1000;
+  switch (String(range)) {
+    case "day":
+      return now - D;
+    case "week":
+      return now - 7 * D;
+    case "month":
+      return now - 30 * D;
+    case "year":
+      return now - 365 * D;
+    case "all":
+    default:
+      return 0;
+  }
+}
+
+// Page through signatures, stop when older than startTs
+async function listSignaturesForAddress(
+  address,
+  {
+    startTs = 0,
+    endTs = Date.now(),
+    pageLimit = 1000,
+    hardLimit = 5000,
+    reqId = "-",
+  } = {}
+) {
+  const out = [];
+  let before;
+  while (out.length < hardLimit) {
+    const page = await heliusRPC(
+      "getSignaturesForAddress",
+      [address, { limit: pageLimit, before }],
+      { reqId }
+    );
+    if (!Array.isArray(page) || page.length === 0) break;
+
+    for (const sig of page) {
+      const ts = (sig.blockTime || 0) * 1000;
+      if (ts && ts < startTs) return out;
+      if (!ts || ts <= endTs) out.push(sig);
+    }
+    before = page[page.length - 1]?.signature;
+    if (!before) break;
+  }
+  return out;
+}
+
+// Keep signature blockTime fallback to avoid empty charts when tx.blockTime is null
+async function fetchWindowedTransactions({
+  wallet,
+  startTs = 0,
+  endTs = Date.now(),
+  detailConcurrency = 4,
+  reqId = "-",
+}) {
+  const sigs = await listSignaturesForAddress(wallet, {
+    startTs,
+    endTs,
+    pageLimit: 1000,
+    hardLimit: 4000,
+    reqId,
+  });
+  const sigList = sigs.map((s) => ({
+    signature: s.signature,
+    sigMs: s.blockTime ? s.blockTime * 1000 : null,
+  }));
+  const out = [];
+  let i = 0;
+  async function worker() {
+    while (i < sigList.length) {
+      const { signature, sigMs } = sigList[i++];
+      try {
+        const tx = await heliusRPC(
+          "getTransaction",
+          [
+            signature,
+            { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+          ],
+          { reqId }
+        );
+        if (tx && tx.meta) out.push({ tx, sigMs });
+      } catch (e) {
+        jlog("warn", "getTransaction failed", {
+          reqId,
+          sig: signature,
+          err: e.message || String(e),
+        });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: detailConcurrency }, () => worker()));
+  return out; // [{ tx, sigMs }]
+}
+
+// ===== (Optional) ATA resolution cache for accurate mint filtering =====
+const ataCache = new Map(); // key: `${wallet}|${mint}` -> { at: ms, pubkeys: Set<string> }
+const ATA_TTL_MS = 10 * 60 * 1000;
+
+async function getWalletMintATAs(wallet, mint, { reqId = "-" } = {}) {
+  const key = `${wallet}|${mint}`;
+  const now = Date.now();
+  const hit = ataCache.get(key);
+  if (hit && now - hit.at < ATA_TTL_MS) return hit.pubkeys;
+
+  const result = await heliusRPC(
+    "getTokenAccountsByOwner",
+    [wallet, { mint }, { encoding: "jsonParsed" }],
+    { reqId }
+  );
+
+  const pubkeys = new Set(
+    Array.isArray(result) ? result.map((r) => r?.pubkey).filter(Boolean) : []
+  );
+  ataCache.set(key, { at: now, pubkeys });
+  return pubkeys;
+}
+
+// Flag transactions that touch a mint for a wallet or that wallet’s ATA(s)
+function extractTrades({ transactions, wallet, mint, ataSet }) {
+  const out = [];
+  for (const tx of transactions) {
+    const pre = tx.meta?.preTokenBalances || [];
+    const post = tx.meta?.postTokenBalances || [];
+    const all = pre.concat(post);
+    const keys = (tx.transaction?.message?.accountKeys || []).map((k) =>
+      typeof k === "string" ? k : k?.pubkey
+    );
+
+    let hit = false;
+    for (const b of all) {
+      if (b.mint !== mint) continue;
+      // Prefer explicit owner, else map accountIndex
+      const owner =
+        b.owner ||
+        (typeof b.accountIndex === "number" ? keys[b.accountIndex] : null);
+      if (owner === wallet) {
+        hit = true;
+        break;
+      }
+      // Also accept direct hits on resolved ATA pubkeys (owner may not be present in some nodes)
+      const acctPubkey =
+        typeof b.accountIndex === "number" && b.accountIndex >= 0
+          ? keys[b.accountIndex]
+          : null;
+      if (acctPubkey && ataSet && ataSet.has(acctPubkey)) {
+        hit = true;
+        break;
+      }
+    }
+    if (hit)
+      out.push({
+        signature: tx.transaction.signatures?.[0],
+        slot: tx.slot,
+        ts: (tx.blockTime || 0) * 1000,
+      });
+  }
+  return out;
+}
+
+// ===== Stream wiring (reuses your ./heliusStream.js) =====
+const { createWalletMintStream } = require("./heliusStream");
+
+async function saveEventToDB(event) {
+  // TODO: plug in your DB write (Mongo/PG/etc)
+  // await db.collection("wallet_mint_events").insertOne(event);
 }
 
 const stream = createWalletMintStream({
-  heliusApiKey: process.env.HELIUS_API_KEY,
+  heliusApiKey: HELIUS_API_KEY,
   onEvent: (e) =>
     saveEventToDB(e).catch((err) =>
       jlog("error", "[stream] saveEventToDB failed", {
@@ -54,109 +325,256 @@ const stream = createWalletMintStream({
     ),
   onLog: ({ level, msg, context }) =>
     jlog(`stream:${level}`, msg, context || {}),
+  // knobs are tunable here if needed
+  // commitment: "finalized",
+  // backfillLimit: 15,
+  // maxDetailConcurrency: 2,
 });
 
-let connectedFlag = false;
 let currentPair = { wallet: null, mint: null };
 
-async function startStreamImpl(args) {
-  if (typeof stream.connect === "function") return stream.connect(args);
-  if (typeof stream.start === "function") return stream.start(args);
-  throw new Error("No start/connect method on stream");
-}
-async function stopStreamImpl() {
-  if (typeof stream.disconnect === "function") return stream.disconnect();
-  if (typeof stream.stop === "function") return stream.stop();
-  throw new Error("No stop/disconnect method on stream");
-}
-function isStreamConnected() {
-  if (typeof stream.isConnected === "function") return !!stream.isConnected();
-  if ("connected" in stream) return !!stream.connected;
-  return connectedFlag;
-}
+// ===== /api router (mount BEFORE any static/catch-all) =====
+const api = express.Router();
 
-function isBase58(s) {
-  return typeof s === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s);
-}
-
-const startStream = async (req, res) => {
-  const payload =
-    (req.body && Object.keys(req.body).length ? req.body : req.query) || {};
-  const wallet = payload.wallet || null;
-  const mint = payload.mint || null;
-  const reqId = req.id;
-
-  // REQUIRE BOTH for your use case
-  if (!wallet || !mint) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Provide BOTH wallet and mint" });
-  }
-  if (!isBase58(wallet)) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Invalid wallet (base58 expected)" });
-  }
-  if (!isBase58(mint)) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Invalid mint (base58 expected)" });
-  }
-
+// Health & routes
+api.get("/health", (_req, res) =>
+  res.json({ ok: true, ts: Date.now(), env: NODE_ENV })
+);
+api.get("/_routes", (_req, res) => {
   try {
-    await startStreamImpl({ wallet, mint });
+    const rows = [];
+    api.stack.forEach((layer) => {
+      if (layer.route) {
+        const methods = Object.keys(layer.route.methods).map((m) =>
+          m.toUpperCase()
+        );
+        methods.forEach((m) =>
+          rows.push({ method: m, path: `/api${layer.route.path}` })
+        );
+      }
+    });
+    res.json({ ok: true, routes: rows });
+  } catch (e) {
+    res.json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+// Stream controls
+api.post("/stream/start", async (req, res) => {
+  const { wallet, mint } = req.body || {};
+  if (!wallet || !mint)
+    return res
+      .status(400)
+      .json({ ok: false, error: "'wallet' and 'mint' are required" });
+  try {
+    const same = currentPair.wallet === wallet && currentPair.mint === mint;
+    if (same && stream.isConnected())
+      return res.json({ ok: true, status: "connected", wallet, mint });
+
+    if (currentPair.wallet && currentPair.mint)
+      await stream.setPair({ wallet, mint });
+    else await stream.start({ wallet, mint });
+
     currentPair = { wallet, mint };
-    connectedFlag = true;
-    jlog("info", "/api/stream/start connected", { reqId, wallet, mint });
     res.json({ ok: true, status: "connected", wallet, mint });
   } catch (e) {
-    jlog("error", "/api/stream/start failed", {
-      reqId,
-      err: e.message || String(e),
-    });
+    jlog("error", "/api/stream/start failed", { err: e.message || String(e) });
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
-};
+});
 
-const stopStream = async (req, res) => {
-  const reqId = req.id;
+api.post("/stream/stop", async (_req, res) => {
   try {
-    await stopStreamImpl();
+    stream.stop();
     const prev = currentPair;
     currentPair = { wallet: null, mint: null };
-    connectedFlag = false;
-    jlog("info", "/api/stream/stop ok", { reqId, prev });
+    jlog("info", "/api/stream/stop ok", { prev });
     res.json({ ok: true, status: "stopped", prev });
   } catch (e) {
-    jlog("error", "/api/stream/stop failed", {
+    jlog("error", "/api/stream/stop failed", { err: e.message || String(e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+api.get("/stream/status", (_req, res) => {
+  res.json({ ok: true, connected: stream.isConnected(), pair: currentPair });
+});
+
+// /api/review — counts only (until you wire PnL)
+api.get("/review", async (req, res) => {
+  const reqId = req.id;
+  try {
+    const { mint, wallet, range = "all" } = req.query;
+    if (!wallet || !mint)
+      return res.json({ trades: 0, winPct: 0, totalPnl: 0, avgPnl: 0 });
+
+    const startTs = rangeStartTs(range);
+    const endTs = Date.now();
+
+    const txs = await fetchWindowedTransactions({
+      wallet,
+      startTs,
+      endTs,
+      reqId,
+    });
+    const ataSet = await getWalletMintATAs(wallet, mint, { reqId }); // resolve ATAs
+    const trades = extractTrades({
+      transactions: txs.map((t) => t.tx),
+      wallet,
+      mint,
+      ataSet,
+    });
+
+    res.json({ trades: trades.length, winPct: 0, totalPnl: 0, avgPnl: 0 });
+  } catch (e) {
+    jlog("error", "/api/review failed", { reqId, err: e.message || String(e) });
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// /api/ohlc — pseudo-OHLC: hourly counts of wallet (optionally minted-filtered)
+api.get("/ohlc", async (req, res) => {
+  const reqId = req.id;
+  try {
+    const { wallet, mint, range = "week" } = req.query;
+    if (!wallet) return res.json({ candles: [], granularity: "1h" });
+
+    const startTs = rangeStartTs(range);
+    const endTs = Date.now();
+    const txs = await fetchWindowedTransactions({
+      wallet,
+      startTs,
+      endTs,
+      reqId,
+    });
+
+    let events = txs
+      .map(({ tx, sigMs }) => {
+        const ms = tx.blockTime ? tx.blockTime * 1000 : sigMs; // fallback on signature time
+        return ms ? { ts: ms, tx } : null;
+      })
+      .filter(Boolean);
+
+    if (mint) {
+      const ataSet = await getWalletMintATAs(wallet, mint, { reqId });
+      const signatures = new Set(
+        extractTrades({
+          transactions: txs.map((t) => t.tx),
+          wallet,
+          mint,
+          ataSet,
+        }).map((t) => t.signature)
+      );
+      events = events.filter((e) =>
+        signatures.has(e.tx.transaction.signatures?.[0])
+      );
+    }
+
+    // Bucket per hour → o=h=l=c=count, v=count (placeholder for charting)
+    const buckets = new Map();
+    for (const e of events) {
+      const hour = Math.floor(e.ts / (60 * 60 * 1000)) * (60 * 60 * 1000);
+      buckets.set(hour, (buckets.get(hour) || 0) + 1);
+    }
+    const times = Array.from(buckets.keys()).sort((a, b) => a - b);
+    const candles = times.map((t) => {
+      const v = buckets.get(t) || 0;
+      return { t, o: v, h: v, l: v, c: v, v };
+    });
+
+    jlog("info", "ohlc buckets", {
+      reqId,
+      buckets: candles.length,
+      events: events.length,
+    });
+    res.json({ candles, granularity: "1h" });
+  } catch (e) {
+    jlog("error", "/api/ohlc failed", { reqId, err: e.message || String(e) });
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// /api/wallet/summary — list mints this wallet touched in the window
+api.get("/wallet/summary", async (req, res) => {
+  const reqId = req.id;
+  try {
+    const { wallet, range = "month" } = req.query;
+    if (!wallet)
+      return res.status(400).json({ ok: false, error: "'wallet' is required" });
+
+    const startTs = rangeStartTs(range);
+    const txs = await fetchWindowedTransactions({
+      wallet,
+      startTs,
+      endTs: Date.now(),
+      reqId,
+    });
+
+    const counts = new Map();
+    for (const { tx } of txs) {
+      const pre = tx.meta?.preTokenBalances || [];
+      const post = tx.meta?.postTokenBalances || [];
+      const all = pre.concat(post);
+      const keys = (tx.transaction?.message?.accountKeys || []).map((k) =>
+        typeof k === "string" ? k : k?.pubkey
+      );
+
+      const touched = new Set();
+      for (const b of all) {
+        const mint = b.mint;
+        if (!mint) continue;
+        const owner =
+          b.owner ||
+          (typeof b.accountIndex === "number" ? keys[b.accountIndex] : null);
+        if (owner === wallet) touched.add(mint);
+      }
+      for (const m of touched) counts.set(m, (counts.get(m) || 0) + 1);
+    }
+
+    const mints = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([mint, count]) => ({ mint, count }));
+
+    res.json({ ok: true, wallet, range, totalTx: txs.length, mints });
+  } catch (e) {
+    jlog("error", "/api/wallet/summary failed", {
       reqId,
       err: e.message || String(e),
     });
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
-};
-
-app.post("/api/stream/start", startStream);
-app.get("/api/stream/start", startStream);
-
-app.post("/api/stream/stop", stopStream);
-app.get("/api/stream/stop", stopStream);
-
-app.get("/api/stream/status", (_req, res) => {
-  res.json({ ok: true, connected: isStreamConnected(), pair: currentPair });
 });
 
-// --- 404 ---
+// Mount router early (before any static/catch-all)
+app.use("/api", api);
+
+// Final 404 JSON
 app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "Not Found",
-    method: req.method,
-    path: req.originalUrl,
-  });
+  jlog("warn", "404", { method: req.method, path: req.originalUrl });
+  res.status(404).json({ ok: false, status: 404, path: req.originalUrl });
 });
 
-// --- Start server ---
-app.listen(PORT, () => {
-  jlog("info", `API server listening on http://localhost:${PORT}`);
-});
+// Server & graceful shutdown
+const server = http.createServer(app);
+server.keepAliveTimeout = 75_000; // AWS ALB default friendliness
+server.headersTimeout = 79_000;
+
+server.listen(PORT, () =>
+  jlog("info", `API server listening on http://localhost:${PORT}`)
+);
+
+function shutdown(signal) {
+  jlog("info", `received ${signal}, shutting down`);
+  try {
+    stream.stop?.();
+  } catch {}
+  server.close((err) => {
+    if (err) {
+      jlog("error", "server close error", { err: err.message || String(err) });
+      process.exit(1);
+    }
+    process.exit(0);
+  });
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
