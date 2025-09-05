@@ -1,11 +1,3 @@
-// app.js — Express API server with Helius stream integration (ALL endpoints under /api)
-// - Uses your existing ./heliusStream.js (no hardcoded wallet/mint)
-// - Control routes:  POST /api/stream/start, POST /api/stream/stop, GET /api/stream/status
-// - Analytics:       GET  /api/review, GET /api/ohlc
-// - Utilities:       GET  /api/wallet/summary, GET /api/health, GET /api/_routes
-// - Production touches: JSON logging, strict CORS via ORIGIN env, graceful shutdown,
-//                       retrying Helius RPC, signature-time fallback, ATA resolution cache.
-
 require("dotenv").config();
 
 const express = require("express");
@@ -13,6 +5,9 @@ const cors = require("cors");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
 const http = require("http");
+const mongoose = require("mongoose");
+const { Trade } = require("./models"); // uses your central schemas
+const { getQuote } = require("./getQuote"); // make sure this exports getQuote
 
 // ===== ENV & App bootstrap =====
 const app = express();
@@ -20,6 +15,7 @@ const PORT = Number(process.env.PORT || 1234);
 const ORIGIN = process.env.ORIGIN || ""; // e.g. https://dashboard.yourdomain.com
 const NODE_ENV = process.env.NODE_ENV || "development";
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 // Warn if key missing (health still works; data endpoints will fail)
 if (!HELIUS_API_KEY) {
@@ -90,6 +86,16 @@ app.use(
       : {}
   )
 );
+
+// --- Mongo
+if (!process.env.MONGO_URI) {
+  jlog("warn", "MONGO_URI not set — /api/trades* will fail");
+} else {
+  mongoose
+    .connect(process.env.MONGO_URI)
+    .then(() => jlog("info", "[db] connected"))
+    .catch((err) => jlog("error", "[db] connect failed", { err: err.message }));
+}
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "512kb" }));
@@ -542,6 +548,91 @@ api.get("/wallet/summary", async (req, res) => {
       err: e.message || String(e),
     });
     res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// /api/price — live quote (price of `mint` in USDC by default)
+api.get("/price", async (req, res) => {
+  try {
+    const mint = req.query.mint;
+    const vs = req.query.vs || USDC;
+    const amount = String(req.query.amount || "1000000"); // base units of mint
+    if (!mint) return res.status(400).json({ error: "mint required" });
+
+    // getQuote should accept { inMint, outMint, amount } and return a shape with price
+    const q = await getQuote({ inMint: mint, outMint: vs, amount });
+
+    let price = Number(q?.price);
+    if (
+      !Number.isFinite(price) &&
+      q?.outAmount &&
+      q?.outDecimals != null &&
+      q?.inDecimals != null
+    ) {
+      const out = Number(q.outAmount) / 10 ** Number(q.outDecimals);
+      const inn = Number(amount) / 10 ** Number(q.inDecimals);
+      price = out / inn;
+    }
+
+    if (!Number.isFinite(price))
+      return res.status(502).json({ error: "bad quote shape", q });
+
+    res.json({ ts: Date.now(), mint, vs, price });
+  } catch (e) {
+    jlog("error", "/api/price failed", { err: e.message || String(e) });
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// helper to build time filter
+function buildQuery(req) {
+  const q = {};
+  if (req.query.mint) q.mint = req.query.mint;
+  if (req.query.from || req.query.to) {
+    q.ts = {};
+    if (req.query.from) q.ts.$gte = new Date(req.query.from);
+    if (req.query.to) q.ts.$lte = new Date(req.query.to);
+  }
+  return q;
+}
+
+// GET /api/trades
+api.get("/trades", async (req, res) => {
+  try {
+    const q = buildQuery(req);
+    const limit = Math.min(Number(req.query.limit || 500), 5000);
+    const rows = await Trade.find(q).sort({ ts: -1 }).limit(limit).lean();
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// GET /api/trades/summary
+api.get("/trades/summary", async (req, res) => {
+  try {
+    const q = buildQuery(req);
+    const limit = Math.min(Number(req.query.limit || 500), 5000);
+    const rows = await Trade.find(q).sort({ ts: -1 }).limit(limit).lean();
+
+    const sells = rows.filter((r) => r.side === "SELL");
+    const pnl = sells.map((s) => Number(s.pnl) || 0);
+    const total = pnl.reduce((a, b) => a + b, 0);
+    const trades = sells.length;
+    const wins = pnl.filter((v) => v > 0).length;
+
+    res.json({
+      sells,
+      pollsByCycle: [],
+      kpis: {
+        trades,
+        winPct: trades ? (wins / trades) * 100 : 0,
+        total,
+        avg: trades ? total / trades : 0,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
